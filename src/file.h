@@ -18,32 +18,35 @@
 struct GrooveFilePrivate {
     struct GrooveFile externals;
     struct Groove *groove;
-    int audio_stream_index;
-    struct GrooveAtomicBool abort_request; // true when we're closing the file
-    AVFormatContext *ic;
-    AVCodec *decoder;
-    AVStream *audio_st;
-    unsigned char *avio_buf;
-    AVIOContext *avio;
-    struct GrooveCustomIo *custom_io;
 
-    // this mutex protects the fields in this block
-    pthread_mutex_t seek_mutex;
+    // decoding
+    AVFormatContext *ctx;
+    AVCodec *decoder;
+    AVCodecContext *decoder_ctx;
+    int stream_idx;
+    AVStream *stream;
+    AVPacket pkt;
+    double decode_pos; // position of the decode head
+    struct GrooveAtomicBool abort_request; // true when we're closing the file
+
+    // saving
+    AVFormatContext *sav_ctx;
+    int tempfile_exists;
+
+    // io
+    FILE *stdfile;
+    AVIOContext *avio;
+    unsigned char *avio_buf;
+    struct GrooveCustomIo *custom_io;
+    struct GrooveCustomIo prealloc_custom_io;
+
+    // seeking
+    pthread_mutex_t seek_mutex; // this mutex protects the fields in this block
     int64_t seek_pos; // -1 if no seek request
     int seek_flush; // whether the seek request wants us to flush the buffer
     bool ever_seeked;
-
     int eof;
-    double audio_clock; // position of the decode head
-    AVPacket audio_pkt;
-
-    // state while saving
-    AVFormatContext *oc;
-    int tempfile_exists;
-
     int paused;
-    struct GrooveCustomIo prealloc_custom_io;
-    FILE *stdfile;
 };
 
 #endif

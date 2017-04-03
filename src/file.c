@@ -73,7 +73,7 @@ static void init_file_state(struct GrooveFilePrivate *f) {
     struct Groove *groove = f->groove;
     memset(f, 0, sizeof(struct GrooveFilePrivate));
     f->groove = groove;
-    f->audio_stream_index = -1;
+    f->stream_idx = -1;
     f->seek_pos = -1;
     GROOVE_ATOMIC_STORE(f->abort_request, false);
 }
@@ -100,14 +100,14 @@ int groove_file_open_custom(struct GrooveFile *file, struct GrooveCustomIo *cust
         return GrooveErrorSystemResources;
     }
 
-    f->ic = avformat_alloc_context();
-    if (!f->ic) {
+    f->ctx = avformat_alloc_context();
+    if (!f->ctx) {
         groove_file_close(file);
         return GrooveErrorNoMem;
     }
-    file->filename = f->ic->filename;
-    f->ic->interrupt_callback.callback = decode_interrupt_cb;
-    f->ic->interrupt_callback.opaque = f;
+    file->filename = f->ctx->filename;
+    f->ctx->interrupt_callback.callback = decode_interrupt_cb;
+    f->ctx->interrupt_callback.opaque = f;
 
     const int buffer_size = 8 * 1024;
     f->avio_buf = ALLOCATE_NONZERO(unsigned char, buffer_size);
@@ -125,8 +125,8 @@ int groove_file_open_custom(struct GrooveFile *file, struct GrooveCustomIo *cust
     f->avio->seekable = AVIO_SEEKABLE_NORMAL;
     f->avio->direct = AVIO_FLAG_DIRECT;
 
-    f->ic->pb = f->avio;
-    int err = avformat_open_input(&f->ic, filename_hint, NULL, NULL);
+    f->ctx->pb = f->avio;
+    int err = avformat_open_input(&f->ctx, filename_hint, NULL, NULL);
     if (err < 0) {
         assert(err != AVERROR(EINVAL));
         groove_file_close(file);
@@ -141,7 +141,7 @@ int groove_file_open_custom(struct GrooveFile *file, struct GrooveCustomIo *cust
         }
     }
 
-    err = avformat_find_stream_info(f->ic, NULL);
+    err = avformat_find_stream_info(f->ctx, NULL);
     if (err < 0) {
         groove_file_close(file);
         return GrooveErrorStreamNotFound;
@@ -149,18 +149,18 @@ int groove_file_open_custom(struct GrooveFile *file, struct GrooveCustomIo *cust
 
     // set all streams to discard. in a few lines here we will find the audio
     // stream and cancel discarding it
-    if (f->ic->nb_streams > INT_MAX) {
+    if (f->ctx->nb_streams > INT_MAX) {
         groove_file_close(file);
         return GrooveErrorTooManyStreams;
     }
-    int stream_count = (int)f->ic->nb_streams;
 
+    int stream_count = (int)f->ctx->nb_streams;
     for (int i = 0; i < stream_count; i++)
-        f->ic->streams[i]->discard = AVDISCARD_ALL;
+        f->ctx->streams[i]->discard = AVDISCARD_ALL;
 
-    f->audio_stream_index = av_find_best_stream(f->ic, AVMEDIA_TYPE_AUDIO, -1, -1, &f->decoder, 0);
+    f->stream_idx = av_find_best_stream(f->ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &f->decoder, 0);
 
-    if (f->audio_stream_index < 0) {
+    if (f->stream_idx < 0) {
         groove_file_close(file);
         return GrooveErrorStreamNotFound;
     }
@@ -170,25 +170,31 @@ int groove_file_open_custom(struct GrooveFile *file, struct GrooveCustomIo *cust
         return GrooveErrorDecoderNotFound;
     }
 
-    f->audio_st = f->ic->streams[f->audio_stream_index];
-    f->audio_st->discard = AVDISCARD_DEFAULT;
+    f->stream = f->ctx->streams[f->stream_idx];
+    f->stream->discard = AVDISCARD_DEFAULT;
 
-    AVCodecContext *avctx = f->audio_st->codec;
+    f->decoder_ctx = avcodec_alloc_context3(f->decoder);
+    if (!f->decoder_ctx) {
+        groove_file_close(file);
+        return GrooveErrorNoMem;
+    }
 
-    if (avcodec_open2(avctx, f->decoder, NULL) < 0) {
+    if (avcodec_parameters_to_context(f->decoder_ctx, f->stream->codecpar) < 0) {
         groove_file_close(file);
         return GrooveErrorDecoding;
     }
 
-    if (!avctx->channel_layout)
-        avctx->channel_layout = av_get_default_channel_layout(avctx->channels);
-    if (!avctx->channel_layout) {
+    if (!f->decoder_ctx->channel_layout)
+        f->decoder_ctx->channel_layout = av_get_default_channel_layout(f->decoder_ctx->channels);
+    if (!f->decoder_ctx->channel_layout) {
         groove_file_close(file);
         return GrooveErrorInvalidChannelLayout;
     }
 
-    // copy the audio stream metadata to the context metadata
-    av_dict_copy(&f->ic->metadata, f->audio_st->metadata, 0);
+    if (avcodec_open2(f->decoder_ctx, f->decoder, NULL) < 0) {
+        groove_file_close(file);
+        return GrooveErrorDecoding;
+    }
 
     return 0;
 }
@@ -231,30 +237,29 @@ void groove_file_close(struct GrooveFile *file) {
 
     GROOVE_ATOMIC_STORE(f->abort_request, true);
 
-    if (f->audio_stream_index >= 0) {
-        AVCodecContext *avctx = f->ic->streams[f->audio_stream_index]->codec;
+    av_packet_unref(&f->pkt);
 
-        av_packet_unref(&f->audio_pkt);
-
-        f->ic->streams[f->audio_stream_index]->discard = AVDISCARD_ALL;
-        avcodec_close(avctx);
-        f->audio_st = NULL;
-        f->audio_stream_index = -1;
+    if (f->stream) {
+        f->stream_idx = -1;
+        f->stream = NULL;
     }
 
     // disable interrupting
     GROOVE_ATOMIC_STORE(f->abort_request, false);
 
-    if (f->ic)
-        avformat_close_input(&f->ic);
+    if (f->ctx)
+        avformat_close_input(&f->ctx);
 
-    pthread_mutex_destroy(&f->seek_mutex);
+    if (f->decoder_ctx)
+        avcodec_free_context(&f->decoder_ctx);
+
+    if (f->stdfile)
+        fclose(f->stdfile);
 
     if (f->avio)
         av_free(f->avio);
 
-    if (f->stdfile)
-        fclose(f->stdfile);
+    pthread_mutex_destroy(&f->seek_mutex);
 
     init_file_state(f);
 }
@@ -273,23 +278,23 @@ void groove_file_destroy(struct GrooveFile *file) {
 
 const char *groove_file_short_names(struct GrooveFile *file) {
     struct GrooveFilePrivate *f = (struct GrooveFilePrivate *) file;
-    return f->ic->iformat->name;
+    return f->ctx->iformat->name;
 }
 
 double groove_file_duration(struct GrooveFile *file) {
     struct GrooveFilePrivate *f = (struct GrooveFilePrivate *) file;
-    double time_base = av_q2d(f->audio_st->time_base);
-    return time_base * f->audio_st->duration;
+    double time_base = av_q2d(f->stream->time_base);
+    return time_base * f->stream->duration;
 }
 
 void groove_file_audio_format(struct GrooveFile *file, struct GrooveAudioFormat *audio_format) {
     struct GrooveFilePrivate *f = (struct GrooveFilePrivate *) file;
 
-    AVCodecContext *codec_ctx = f->audio_st->codec;
-    audio_format->sample_rate = codec_ctx->sample_rate;
-    from_ffmpeg_layout(codec_ctx->channel_layout, &audio_format->layout);
-    audio_format->format = from_ffmpeg_format(codec_ctx->sample_fmt);
-    audio_format->is_planar = from_ffmpeg_format_planar(codec_ctx->sample_fmt);
+    AVCodecParameters *codecpar = f->stream->codecpar;
+    audio_format->sample_rate = codecpar->sample_rate;
+    from_ffmpeg_layout(codecpar->channel_layout, &audio_format->layout);
+    audio_format->format = from_ffmpeg_format(codecpar->format);
+    audio_format->is_planar = from_ffmpeg_format_planar(codecpar->format);
 }
 
 struct GrooveTag *groove_file_metadata_get(struct GrooveFile *file, const char *key,
@@ -299,7 +304,7 @@ struct GrooveTag *groove_file_metadata_get(struct GrooveFile *file, const char *
     const AVDictionaryEntry *e = (const AVDictionaryEntry *) prev;
     if (key && key[0] == 0)
         flags |= AV_DICT_IGNORE_SUFFIX;
-    return (struct GrooveTag *) av_dict_get(f->ic->metadata, key, e, flags);
+    return (struct GrooveTag *) av_dict_get(f->ctx->metadata, key, e, flags);
 }
 
 int groove_file_metadata_set(struct GrooveFile *file, const char *key,
@@ -307,7 +312,7 @@ int groove_file_metadata_set(struct GrooveFile *file, const char *key,
 {
     file->dirty = 1;
     struct GrooveFilePrivate *f = (struct GrooveFilePrivate *) file;
-    return av_dict_set(&f->ic->metadata, key, value, flags);
+    return av_dict_set(&f->ctx->metadata, key, value, flags);
 }
 
 const char *groove_tag_key(struct GrooveTag *tag) {
@@ -323,15 +328,15 @@ const char *groove_tag_value(struct GrooveTag *tag) {
 static void cleanup_save(struct GrooveFile *file) {
     struct GrooveFilePrivate *f = (struct GrooveFilePrivate *) file;
 
-    av_packet_unref(&f->audio_pkt);
+    av_packet_unref(&f->pkt);
     if (f->tempfile_exists) {
-        remove(f->oc->filename);
+        remove(f->sav_ctx->filename);
         f->tempfile_exists = 0;
     }
-    if (f->oc) {
-        avio_closep(&f->oc->pb);
-        avformat_free_context(f->oc);
-        f->oc = NULL;
+    if (f->sav_ctx) {
+        avio_closep(&f->sav_ctx->pb);
+        avformat_free_context(f->sav_ctx);
+        f->sav_ctx = NULL;
     }
 }
 
@@ -339,140 +344,90 @@ int groove_file_save_as(struct GrooveFile *file, const char *filename) {
     struct GrooveFilePrivate *f = (struct GrooveFilePrivate *) file;
 
     // detect output format
-    AVOutputFormat *ofmt = av_guess_format(f->ic->iformat->name, f->ic->filename, NULL);
-    if (!ofmt) {
+    AVOutputFormat *oformat = av_guess_format(f->ctx->iformat->name, f->ctx->filename, NULL);
+    if (!oformat) {
         return GrooveErrorUnknownFormat;
     }
 
     // allocate output media context
-    f->oc = avformat_alloc_context();
-    if (!f->oc) {
+    f->sav_ctx = avformat_alloc_context();
+    if (!f->sav_ctx) {
         cleanup_save(file);
         return GrooveErrorNoMem;
     }
 
-    f->oc->oformat = ofmt;
-    snprintf(f->oc->filename, sizeof(f->oc->filename), "%s", filename);
+    strcpy(f->sav_ctx->filename, filename);
+    f->sav_ctx->oformat = oformat;
+    f->sav_ctx->flags |= AVFMT_FLAG_BITEXACT;
 
     // open output file if needed
-    if (!(ofmt->flags & AVFMT_NOFILE)) {
-        if (avio_open(&f->oc->pb, f->oc->filename, AVIO_FLAG_WRITE) < 0) {
+    if (!(oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&f->sav_ctx->pb, f->sav_ctx->filename, AVIO_FLAG_WRITE) < 0) {
             cleanup_save(file);
             return GrooveErrorFileSystem;
         }
         f->tempfile_exists = 1;
     }
 
-    if (f->ic->nb_streams > INT_MAX) {
+    if (f->ctx->nb_streams > INT_MAX) {
         cleanup_save(file);
         return GrooveErrorTooManyStreams;
     }
-    int stream_count = (int)f->ic->nb_streams;
 
     // add all the streams
+    int stream_count = (int)f->ctx->nb_streams;
     for (int i = 0; i < stream_count; i++) {
-        AVStream *in_stream = f->ic->streams[i];
-        AVStream *out_stream = avformat_new_stream(f->oc, NULL);
+        AVStream *in_stream = f->ctx->streams[i];
+        if (in_stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+            continue;
+
+        AVStream *out_stream = avformat_new_stream(f->sav_ctx, NULL);
         if (!out_stream) {
             cleanup_save(file);
             return GrooveErrorNoMem;
         }
+
         out_stream->id = in_stream->id;
         out_stream->disposition = in_stream->disposition;
         out_stream->time_base = in_stream->time_base;
 
-        AVCodecContext *icodec = in_stream->codec;
-        AVCodecContext *ocodec = out_stream->codec;
-        ocodec->bits_per_raw_sample    = icodec->bits_per_raw_sample;
-        ocodec->chroma_sample_location = icodec->chroma_sample_location;
-        ocodec->codec_id   = icodec->codec_id;
-        ocodec->codec_type = icodec->codec_type;
-        if (!ocodec->codec_tag) {
-            if (!f->oc->oformat->codec_tag ||
-                 av_codec_get_id (f->oc->oformat->codec_tag, icodec->codec_tag) == ocodec->codec_id ||
-                 av_codec_get_tag(f->oc->oformat->codec_tag, icodec->codec_id) <= 0)
-                ocodec->codec_tag = icodec->codec_tag;
-        }
-        ocodec->bit_rate       = icodec->bit_rate;
-        ocodec->rc_max_rate    = icodec->rc_max_rate;
-        ocodec->rc_buffer_size = icodec->rc_buffer_size;
-        ocodec->field_order    = icodec->field_order;
-
-        uint64_t extra_size = (uint64_t)icodec->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE;
-        if (extra_size > INT_MAX) {
-            cleanup_save(file);
-            return GrooveErrorEncoding;
-        }
-        ocodec->extradata      = ALLOCATE(uint8_t, extra_size);
-        if (!ocodec->extradata) {
-            cleanup_save(file);
-            return GrooveErrorNoMem;
-        }
-        memcpy(ocodec->extradata, icodec->extradata, icodec->extradata_size);
-        ocodec->extradata_size = icodec->extradata_size;
-        switch (ocodec->codec_type) {
-        case AVMEDIA_TYPE_AUDIO:
-            ocodec->channel_layout     = icodec->channel_layout;
-            ocodec->sample_rate        = icodec->sample_rate;
-            ocodec->channels           = icodec->channels;
-            ocodec->frame_size         = icodec->frame_size;
-            ocodec->audio_service_type = icodec->audio_service_type;
-            ocodec->block_align        = icodec->block_align;
-            break;
-        case AVMEDIA_TYPE_VIDEO:
-            ocodec->pix_fmt            = icodec->pix_fmt;
-            ocodec->width              = icodec->width;
-            ocodec->height             = icodec->height;
-            ocodec->has_b_frames       = icodec->has_b_frames;
-            if (!ocodec->sample_aspect_ratio.num) {
-                if (in_stream->sample_aspect_ratio.num) {
-                    ocodec->sample_aspect_ratio = in_stream->sample_aspect_ratio;
-                } else if (icodec->sample_aspect_ratio.num) {
-                    ocodec->sample_aspect_ratio = icodec->sample_aspect_ratio;
-                } else {
-                    ocodec->sample_aspect_ratio.num = 0;
-                    ocodec->sample_aspect_ratio.den = 1;
-                }
-            }
-            break;
-        case AVMEDIA_TYPE_SUBTITLE:
-            ocodec->width  = icodec->width;
-            ocodec->height = icodec->height;
-            break;
-        case AVMEDIA_TYPE_DATA:
-        case AVMEDIA_TYPE_ATTACHMENT:
-            break;
-        default:
+        // copy parameters
+        if (avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar) < 0) {
             cleanup_save(file);
             return GrooveErrorEncoding;
         }
     }
 
     // set metadata
-    av_dict_copy(&f->oc->metadata, f->ic->metadata, 0);
+    av_dict_copy(&f->sav_ctx->metadata, f->ctx->metadata, 0);
 
-    if (avformat_write_header(f->oc, NULL) < 0) {
+    if (avformat_write_header(f->sav_ctx, NULL) < 0) {
         cleanup_save(file);
         return GrooveErrorEncoding;
     }
 
-    AVPacket *pkt = &f->audio_pkt;
+    AVPacket *pkt = &f->pkt;
     for (;;) {
-        int err = av_read_frame(f->ic, pkt);
+        int err = av_read_frame(f->ctx, pkt);
         if (err == AVERROR_EOF) {
             break;
         } else if (err < 0) {
             cleanup_save(file);
             return GrooveErrorDecoding;
         }
-        if (av_write_frame(f->oc, pkt) < 0) {
+
+        AVStream *in_stream = f->ctx->streams[pkt->stream_index];
+        if (in_stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+            continue;
+
+        if (av_write_frame(f->sav_ctx, pkt) < 0) {
             cleanup_save(file);
             return GrooveErrorEncoding;
         }
         av_packet_unref(pkt);
     }
 
-    if (av_write_trailer(f->oc) < 0) {
+    if (av_write_trailer(f->sav_ctx) < 0) {
         cleanup_save(file);
         return GrooveErrorEncoding;
     }
@@ -491,7 +446,7 @@ int groove_file_save(struct GrooveFile *file) {
 
     int temp_filename_len;
     char *temp_filename = groove_create_rand_name(f->groove,
-            &temp_filename_len, f->ic->filename, strlen(f->ic->filename));
+            &temp_filename_len, f->ctx->filename, strlen(f->ctx->filename));
 
     if (!temp_filename) {
         cleanup_save(file);
@@ -504,7 +459,7 @@ int groove_file_save(struct GrooveFile *file) {
         return err;
     }
 
-    if (rename(temp_filename, f->ic->filename)) {
+    if (rename(temp_filename, f->ctx->filename)) {
         f->tempfile_exists = 1;
         cleanup_save(file);
         return GrooveErrorFileSystem;
